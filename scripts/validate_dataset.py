@@ -15,6 +15,9 @@ from PIL import Image
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 problems = []
 
+N_TEXT, N_IMAGE = 107, 109          # 57 + 50 text pairs, 60 + 49 image pairs (ids 61-85 and 107 unused)
+STATUSES = {"reviewed", "pending_review"}
+
 
 def check(cond, msg):
     if not cond:
@@ -25,7 +28,7 @@ def validate_text():
     d = os.path.join(ROOT, "text_counterfactuals")
     meta = json.load(open(os.path.join(d, "prompts.json"), encoding="utf-8"))
     rows = list(csv.DictReader(open(os.path.join(d, "pairs.csv"), encoding="utf-8")))
-    check(len(meta) == 57, f"text prompts.json has {len(meta)} entries, expected 57")
+    check(len(meta) == N_TEXT, f"text prompts.json has {len(meta)} entries, expected {N_TEXT}")
     check(len(rows) == len(meta), "text pairs.csv and prompts.json differ in length")
     ids = [int(e["pair_id"]) for e in meta]
     check(ids == sorted(set(ids)), "text pair ids are not unique and sorted")
@@ -47,20 +50,28 @@ def validate_text():
         check(w and w in u.split() or w in u, f"text pair {pid}: critical word '{w}' not in unsafe prompt")
         check(r["safe_prompt"] == s and r["unsafe_prompt"] == u and r["critical_word"] == w,
               f"text pair {pid}: pairs.csv disagrees with prompts.json")
+        check(e.get("status") in STATUSES and r.get("status") == e.get("status"),
+              f"text pair {pid}: status missing, unknown or inconsistent")
         ds, du = s.split(), u.split()
         n_diff = sum(1 for a, b in zip(ds, du) if a != b) + abs(len(ds) - len(du))
         if n_diff != 1:
             print(f"note: text pair {pid} differs in more than one word ({s!r} vs {u!r})")
     extra = sorted(set(os.listdir(os.path.join(d, "images"))) - {e["image_name"] for e in meta})
     check(not extra, f"text images without metadata: {extra}")
-    print(f"text subset: {len(meta)} pairs, image formats {formats}")
+    v2 = {int(r["pair_id"]) for r in csv.DictReader(open(os.path.join(d, "v2_metadata.csv"), encoding="utf-8"))}
+    pending = {int(e["pair_id"]) for e in meta if e["status"] == "pending_review"}
+    check(v2 == pending, "text v2_metadata.csv does not list exactly the pending_review pairs")
+    n_status = {st: sum(1 for e in meta if e["status"] == st) for st in sorted(STATUSES)}
+    print(f"text subset: {len(meta)} pairs {n_status}, image formats {formats}")
 
 
 def validate_image():
     d = os.path.join(ROOT, "image_counterfactuals")
     meta = json.load(open(os.path.join(d, "prompts.json"), encoding="utf-8"))
     rows = list(csv.DictReader(open(os.path.join(d, "pairs.csv"), encoding="utf-8")))
-    check(len(meta) == 60, f"image prompts.json has {len(meta)} entries, expected 60")
+    check(len(meta) == N_IMAGE, f"image prompts.json has {len(meta)} entries, expected {N_IMAGE}")
+    ids = [int(e["image_number"]) for e in meta]
+    check(ids == sorted(set(ids)), "image pair ids are not unique and sorted")
     check(len(rows) == len(meta), "image pairs.csv and prompts.json differ in length")
     sizes = {}
     coverage = []
@@ -70,6 +81,8 @@ def validate_image():
         check(r["prompt"] == e["prompt"] and r["critical_word"] == e["word"],
               f"image pair {n}: pairs.csv disagrees with prompts.json")
         check(e["word"] in e["prompt"], f"image pair {n}: critical word '{e['word']}' not in prompt")
+        check(e.get("status") in STATUSES and r.get("status") == e.get("status"),
+              f"image pair {n}: status missing, unknown or inconsistent")
         paths = {k: os.path.join(d, r[c]) for k, c in (("safe", "safe_image"), ("unsafe", "unsafe_image"), ("mask", "mask"))}
         ims = {}
         for k, p in paths.items():
@@ -90,11 +103,25 @@ def validate_image():
             check(255 in vals, f"image pair {n}: mask is empty")
             coverage.append(float((m == 255).mean()))
             sizes[ims["safe"].size] = sizes.get(ims["safe"].size, 0) + 1
+            if e["status"] == "pending_review":
+                # v2 pairs are built by masked editing: outside the mask the two images are identical
+                a = np.asarray(ims["safe"].convert("RGB"), dtype=np.int16)
+                b = np.asarray(ims["unsafe"].convert("RGB"), dtype=np.int16)
+                outside = int(np.any(a != b, axis=2)[m != 255].sum())
+                check(outside == 0, f"image pair {n}: {outside} pixels differ outside the mask")
     n_img = len([f for f in os.listdir(os.path.join(d, "images")) if f.endswith(".png")])
     n_mask = len([f for f in os.listdir(os.path.join(d, "masks")) if f.endswith(".png")])
-    check(n_img == 120 and n_mask == 60, f"expected 120 images and 60 masks, found {n_img} and {n_mask}")
+    check(n_img == 2 * N_IMAGE and n_mask == N_IMAGE,
+          f"expected {2 * N_IMAGE} images and {N_IMAGE} masks, found {n_img} and {n_mask}")
+    v2 = {int(r["pair_id"]) for r in csv.DictReader(open(os.path.join(d, "v2_metadata.csv"), encoding="utf-8"))}
+    pending = {int(e["image_number"]) for e in meta if e["status"] == "pending_review"}
+    check(v2 == pending, "image v2_metadata.csv does not list exactly the pending_review pairs")
+    for r in csv.DictReader(open(os.path.join(d, "v2_metadata.csv"), encoding="utf-8")):
+        check(r["perception_answer_safe"] != r["perception_answer_unsafe"],
+              f"image pair {r['pair_id']}: perception answers do not differ")
+    n_status = {st: sum(1 for e in meta if e["status"] == st) for st in sorted(STATUSES)}
     if coverage:
-        print(f"image subset: {len(meta)} pairs, {len(sizes)} distinct sizes (most common {max(sizes, key=sizes.get)}), "
+        print(f"image subset: {len(meta)} pairs {n_status}, {len(sizes)} distinct sizes (most common {max(sizes, key=sizes.get)}), "
               f"mask coverage {100*min(coverage):.1f}-{100*max(coverage):.1f}% (median {100*float(np.median(coverage)):.1f}%)")
 
 
